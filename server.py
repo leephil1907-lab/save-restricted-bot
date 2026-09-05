@@ -18,15 +18,8 @@ from main import RestrictedMessageBot
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-
 app = FastAPI(title="TGFlow Control Room", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.getenv("TGFlow_ALLOWED_ORIGIN", "*")],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"]
-)
+app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("TGFlow_ALLOWED_ORIGIN", "*")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 worker: Optional[RestrictedMessageBot] = None
@@ -52,18 +45,12 @@ class Rule(BaseModel):
 async def startup() -> None:
     global worker, worker_task
     worker = RestrictedMessageBot()
-    try:
-        await worker.initialize_clients()
-        add_activity("system", "Telegram clients initialized")
-        # Keep the bot's existing link-processing listener alive.
-        worker_task = asyncio.create_task(worker.run_until_disconnected()) if worker.bot_client else None
-    except Exception as exc:
-        add_activity("error", f"Telegram initialization failed: {exc}")
+    worker_task = asyncio.create_task(worker.run())
+    add_activity("system", "TGFlow Telegram worker started")
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global worker
     if worker:
         if worker.bot_client:
             await worker.bot_client.disconnect()
@@ -80,15 +67,7 @@ async def index() -> FileResponse:
 async def status() -> dict[str, Any]:
     user_connected = bool(worker and worker.user_client and worker.user_client.is_connected())
     bot_connected = bool(worker and worker.bot_client and worker.bot_client.is_connected())
-    return {
-        "ok": True,
-        "worker": "online" if user_connected or bot_connected else "offline",
-        "user_connected": user_connected,
-        "bot_connected": bot_connected,
-        "uptime_seconds": int(time.time() - started_at),
-        "cache_size": len(worker.message_cache) if worker else 0,
-        "rules": len(rules),
-    }
+    return {"ok": True, "worker": "online" if user_connected or bot_connected else "offline", "user_connected": user_connected, "bot_connected": bot_connected, "uptime_seconds": int(time.time() - started_at), "cache_size": len(worker.message_cache) if worker else 0, "rules": len(rules)}
 
 
 @app.get("/api/activity")
@@ -121,20 +100,19 @@ async def delete_rule(rule_id: str) -> dict[str, bool]:
 
 @app.post("/api/worker/restart")
 async def restart_worker() -> dict[str, Any]:
-    global worker
-    if worker is None:
+    if not worker:
         raise HTTPException(503, "Worker is not initialized")
+    if worker.bot_client:
+        await worker.bot_client.disconnect()
+    if worker.user_client:
+        await worker.user_client.disconnect()
     await worker.initialize_clients()
-    add_activity("system", "Telegram worker restarted")
+    add_activity("system", "Telegram clients restarted")
     return await status()
 
 
 @app.get("/api/source/history")
-async def source_history(
-    chat: str = Query(..., min_length=1),
-    limit: int = Query(25, ge=1, le=100),
-    before: Optional[int] = Query(None),
-) -> dict[str, Any]:
+async def source_history(chat: str = Query(..., min_length=1), limit: int = Query(25, ge=1, le=100), before: Optional[int] = Query(None)) -> dict[str, Any]:
     if not worker or not worker.user_client or not worker.user_client.is_connected():
         raise HTTPException(503, "Telegram user session is offline")
     try:
@@ -144,23 +122,8 @@ async def source_history(
         for message in messages:
             if not message:
                 continue
-            media_type = None
-            if message.photo:
-                media_type = "photo"
-            elif message.video:
-                media_type = "video"
-            elif message.audio:
-                media_type = "audio"
-            elif message.document:
-                media_type = "document"
-            items.append({
-                "id": message.id,
-                "date": message.date.isoformat() if message.date else None,
-                "text": message.text or "",
-                "media_type": media_type,
-                "has_media": bool(message.media),
-                "protected": bool(getattr(message, "noforwards", False)),
-            })
+            media_type = "video" if message.video else "audio" if message.audio else "photo" if message.photo else "document" if message.document else None
+            items.append({"id": message.id, "date": message.date.isoformat() if message.date else None, "text": message.text or "", "media_type": media_type, "has_media": bool(message.media), "protected": bool(getattr(message, "noforwards", False))})
         add_activity("history", f"Loaded {len(items)} messages from {chat}")
         return {"chat": chat, "messages": items, "next_before": items[-1]["id"] if items else None}
     except Exception as exc:
